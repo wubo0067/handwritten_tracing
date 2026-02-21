@@ -79,6 +79,15 @@ font_size ∝ A4 宽度 / (repeat × 组宽 + (repeat - 1) × group_spacing + 2 
 
 - **已将 repeat 改为 5，rows 改为 35**：字号会从约 46px 增大到约 65px（约大 40%），获得更舒适的大字显示效果。
 
+## 字体生成命令
+在完成字体提取过程后，会生成相应的 FontForge 脚本文件。要生成最终的 TTF 字体文件，需要运行以下命令：
+
+```bash
+fontforge.exe --script output_glyphs/generate_font.py
+```
+
+此命令将在 `output_glyphs/` 目录中查找 [generate_font.py](file://j:\my_project\coding-net\handwritten_tracing\output_glyphs\generate_font.py) 脚本并执行它，生成 [output_font.ttf](file://j:\my_project\coding-net\handwritten_tracing\output_font.ttf) 文件。
+
 ## 应用场景
 - 个人手写体数字化
 - 特殊字体设计

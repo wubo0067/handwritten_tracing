@@ -14,7 +14,7 @@ def main():
         font_path="output_font.ttf",
         output_path="output_a4.png",
         repeat=7,  # 单行大字：3 组/行 → 字号约 457px；改为 2 可达 710px
-        rows=40,
+        rows=39,
         font_size=None,
         supersample=6,  # 提升清晰度（默认 4，改 6 后边缘更平滑，内存翻 1.5 倍）
         letter_spacing=2,  # 组内字间距收窄（px）
