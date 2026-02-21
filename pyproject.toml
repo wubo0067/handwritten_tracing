@@ -5,6 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cupy-cuda12x>=14.0.1",
     "opencv-python>=4.13.0.92",
     "pytesseract>=0.3.13",
+    "scipy>=1.11",
 ]
+
+[project.optional-dependencies]
+# CUDA GPU 支持：安装时需要与本机 CUDA 版本匹配的 cupy
+# 例： CUDA 12.x 用 pip install cupy-cuda12x
+gpu = []

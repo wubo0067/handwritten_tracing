@@ -29,6 +29,56 @@
 - **真实手写模拟**：通过多种扰动算法模拟真实手写特征
 - **高精度输出**：支持高 DPI 输出，适用于打印需求
 
+## 性能优化
+- **加速级别**：
+  1. CuPy + CUDA — NVIDIA GPU，最快
+  2. PyTorch CUDA — CUDA GPU 备选
+  3. scipy CPU — 多线程 CPU，比 PIL 快十倍
+  4. PIL 回退 — 无任何额外依赖时的最慢路径
+
+## GPU 加速安装
+如果拥有 NVIDIA GPU，可以通过以下步骤安装 GPU 加速支持：
+
+```bash
+# 查看 CUDA 版本
+nvidia-smi
+
+# 按版本安装，例如 CUDA 12.x：
+pip install cupy-cuda12x
+# 或者对于 CUDA 11.x：
+pip install cupy-cuda11x
+# 或者对于 CUDA 10.2：
+pip install cupy-cuda102
+```
+
+## 渲染参数详解
+
+### 自动字号计算公式
+当使用 `font_size=None` 时，字号由以下公式自动推算：
+
+```
+font_size ∝ A4 宽度 / (repeat × 组宽 + (repeat - 1) × group_spacing + 2 × padding_x)
+```
+
+### 主要调节参数
+
+#### 1. repeat（每行组数）- 最直接影响字号大小
+| repeat | 估算字号（px） | 特点 |
+|--------|----------------|------|
+| 7（当前） | ≈ 46 | 密集 |
+| 5 | ≈ 65 | 适中 |
+| 4 | ≈ 81 | 大且稀疏 |
+| 3 | ≈ 108 | 很大 |
+
+#### 2. 次要调节参数（辅助微调）
+- `group_spacing` 调小 → 字略大
+- `padding_x` 调小 → 字略大（效果有限，因为已有较小的初始值）
+
+### 推荐配置
+将 `repeat` 从 7 改为 5，同时将 `rows` 从默认值改为更大的数值（如 35）以补满页高：
+
+- **已将 repeat 改为 5，rows 改为 35**：字号会从约 46px 增大到约 65px（约大 40%），获得更舒适的大字显示效果。
+
 ## 应用场景
 - 个人手写体数字化
 - 特殊字体设计

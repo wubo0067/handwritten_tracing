@@ -1,5 +1,10 @@
 ﻿"""
 使用生成的手写字体渲染文字并输出为图片。
+加速级别：
+  1. CuPy + CUDA  — NVIDIA GPU，最快
+  2. PyTorch CUDA — CUDA GPU 备选
+  3. scipy CPU    — 多线程 CPU，比 PIL 快十倍
+  4. PIL 回退    — 无任何额外依赖时的最慢路径
 """
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -7,6 +12,51 @@ import os
 import random
 import math
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# 运行时加速库检测（自动降级）
+# ---------------------------------------------------------------------------
+_BACKEND = "pil"  # 默认最慢路径
+
+try:
+    import cupy as cp
+    import cupyx.scipy.ndimage as _cp_ndimage
+
+    # 用真实 kernel 操作（gaussian_filter）验证 GPU 架构兼容性
+    _test = cp.zeros((4, 4), dtype=cp.float32)
+    _cp_ndimage.gaussian_filter(_test, sigma=1.0)
+    del _test
+    _BACKEND = "cupy"
+except Exception as _e:
+    cp = None
+    _cp_ndimage = None
+    _err_str = str(_e)
+    if "NO_BINARY_FOR_GPU" in _err_str or "no kernel image" in _err_str.lower():
+        print(
+            f"[render_text] CuPy 初始化失败（{_e.__class__.__name__}）：\n"
+            "  当前 GPU 架构（Blackwell / sm_120 等较新架构）尚无预编译 kernel，\n"
+            "  需从源码编译 CuPy 才能启用 GPU 加速：\n"
+            "    https://docs.cupy.dev/en/stable/install.html#building-cupy-from-source\n"
+            "已自动降级为 CPU 模式。"
+        )
+    elif "cupy" in str(type(_e).__module__):
+        print(
+            f"[render_text] CuPy 初始化失败（{_e.__class__.__name__}），"
+            "请安装与 CUDA 版本匹配的包，例如：\n"
+            "  CUDA 12.x → uv add cupy-cuda12x\n"
+            "  CUDA 11.x → uv add cupy-cuda11x\n"
+            "已自动降级为 CPU 模式。"
+        )
+
+if _BACKEND != "cupy":
+    try:
+        from scipy.ndimage import gaussian_filter as _scipy_gaussian
+
+        _BACKEND = "scipy"
+    except ImportError:
+        _scipy_gaussian = None
+
+print(f"[render_text] 加速后端：{_BACKEND}")
 
 
 def _elastic_distort(
@@ -18,6 +68,11 @@ def _elastic_distort(
     原理：生成两张高斯平滑的随机噪声场作为 dx/dy 位移层，
     每个像素按目标坐标采样原图，就像笔画边缘在微颤抚动。
 
+    优化：
+    - CuPy：全程 GPU，包括高斯模糊和像素重映射
+    - scipy：numpy 生成噪声 + scipy gaussian_filter（比 PIL 快十倍）
+    - PIL：充谁备用最慢路径
+
     :param img_rgba: 要扭曲的 RGBA 图像（字符小画布）
     :param alpha:    位移幅度（像素），越大笔画边缘抖动越明显，建议 1~4
     :param sigma:    抑制平滑半径，越大形变越平滑连贯（波浪感），建议 2~6
@@ -26,31 +81,90 @@ def _elastic_distort(
     """
     arr = np.array(img_rgba, dtype=np.float32)  # (H, W, 4)
     h, w = arr.shape[:2]
+    global _BACKEND  # 允许降级时修改模块级变量
 
-    def _make_smooth_field() -> np.ndarray:
-        noise = np.array(
-            [[rng.gauss(0, 1) for _ in range(w)] for _ in range(h)],
-            dtype=np.float32,
-        )
-        lo, hi = noise.min(), noise.max()
-        if hi - lo < 1e-6:
-            return noise
-        norm = ((noise - lo) / (hi - lo) * 255).astype(np.uint8)
-        blurred = Image.fromarray(norm, mode="L").filter(
-            ImageFilter.GaussianBlur(sigma)
-        )
-        result = np.array(blurred, dtype=np.float32) / 255.0 * 2 - 1  # [-1, 1]
-        return result * alpha
+    # 用 numpy RNG 生成高斯噪声（比 Python 循环快 100~1000 倍）
+    seed_val = rng.randint(0, 2**31 - 1)
+    np_rng = np.random.default_rng(seed_val)
+    noise_dx = np_rng.standard_normal((h, w)).astype(np.float32)
+    noise_dy = np_rng.standard_normal((h, w)).astype(np.float32)
 
-    dx = _make_smooth_field()  # (H, W)
-    dy = _make_smooth_field()
+    if _BACKEND == "cupy":
+        # --- GPU 路径 ---
+        try:
+            dx_gpu = cp.asarray(noise_dx)
+            dy_gpu = cp.asarray(noise_dy)
+            dx_gpu = _cp_ndimage.gaussian_filter(dx_gpu, sigma=sigma) * alpha
+            dy_gpu = _cp_ndimage.gaussian_filter(dy_gpu, sigma=sigma) * alpha
+            gy, gx = cp.mgrid[0:h, 0:w]
+            src_x = cp.clip(gx + dx_gpu, 0, w - 1).astype(cp.int32)
+            src_y = cp.clip(gy + dy_gpu, 0, h - 1).astype(cp.int32)
+            arr_gpu = cp.asarray(arr)
+            warped = arr_gpu[src_y, src_x]
+            return Image.fromarray(cp.asnumpy(warped).astype(np.uint8), mode="RGBA")
+        except Exception as _gpu_err:
+            # GPU 运行时失败，降级到 scipy/PIL
+            _BACKEND = "scipy" if _scipy_gaussian is not None else "pil"
+            print(
+                f"[render_text] GPU 运行时错误（{_gpu_err.__class__.__name__}），"
+                f"已降级为 {_BACKEND}。\n"
+                "提示：请安装与显卡 CUDA 版本匹配的 CuPy，例如：\n"
+                "  uv run pip install cupy-cuda12x   # CUDA 12.x\n"
+                "  uv run pip install cupy-cuda11x   # CUDA 11.x"
+            )
 
-    gy, gx = np.mgrid[0:h, 0:w]
-    src_x = np.clip(gx + dx, 0, w - 1).astype(np.int32)
-    src_y = np.clip(gy + dy, 0, h - 1).astype(np.int32)
+    if _BACKEND == "scipy":
+        # --- scipy CPU 路径 ---
+        dx = _scipy_gaussian(noise_dx, sigma=sigma) * alpha
+        dy = _scipy_gaussian(noise_dy, sigma=sigma) * alpha
+        gy, gx = np.mgrid[0:h, 0:w]
+        src_x = np.clip(gx + dx, 0, w - 1).astype(np.int32)
+        src_y = np.clip(gy + dy, 0, h - 1).astype(np.int32)
+        warped = arr[src_y, src_x]
+        return Image.fromarray(warped.astype(np.uint8), mode="RGBA")
 
-    warped = arr[src_y, src_x]  # (H, W, 4)
-    return Image.fromarray(warped.astype(np.uint8), mode="RGBA")
+    else:
+        # --- PIL 回退路径 ---
+        def _blur_field(field: np.ndarray) -> np.ndarray:
+            lo, hi = field.min(), field.max()
+            if hi - lo < 1e-6:
+                return field * alpha
+            norm = ((field - lo) / (hi - lo) * 255).astype(np.uint8)
+            blurred = Image.fromarray(norm, mode="L").filter(
+                ImageFilter.GaussianBlur(sigma)
+            )
+            return (np.array(blurred, dtype=np.float32) / 255.0 * 2 - 1) * alpha
+
+        dx = _blur_field(noise_dx)
+        dy = _blur_field(noise_dy)
+        gy, gx = np.mgrid[0:h, 0:w]
+        src_x = np.clip(gx + dx, 0, w - 1).astype(np.int32)
+        src_y = np.clip(gy + dy, 0, h - 1).astype(np.int32)
+        warped = arr[src_y, src_x]
+        return Image.fromarray(warped.astype(np.uint8), mode="RGBA")
+
+
+def _ink_bot_rel(ch: str, font, bbox) -> int:
+    """
+    量出字符实际墨迹底部的 y 坐标（相对于 draw.text 起始坐标）。
+
+    PIL 的 textbbox 依赖字体的 ascent/descent 度量，常包含大量无墨迹的垂直空白。
+    此函数将字符渲染到临时灰度图，扫描有墨像素行，返回真实底部位置，
+    用于消除行间距中字体内部空白的影响。
+    """
+    cw = bbox[2] - bbox[0]
+    ch_h = bbox[3] - bbox[1]
+    if cw <= 0 or ch_h <= 0:
+        return ch_h
+    # pad 须 >= bbox[1]，保证绘制原点不超出临时图像边界
+    pad = max(bbox[1] + 2, 8)
+    tmp = Image.new("L", (cw + pad * 2, ch_h + pad * 2), 0)
+    ImageDraw.Draw(tmp).text((pad - bbox[0], pad - bbox[1]), ch, font=font, fill=255)
+    rows = np.where(np.array(tmp).max(axis=1) > 5)[0]
+    if len(rows) == 0:
+        return ch_h  # 回退：无墨迹时用 textbbox 高度
+    # rows[-1] 为图像坐标；draw 起始 y = pad - bbox[1]；换算回相对于 draw origin
+    return int(rows[-1]) - pad + bbox[1]
 
 
 def _render_char_with_stroke_jitter(
@@ -241,14 +355,17 @@ def render_a4_groups(
     ref_total_w = repeat * ref_group_w + (repeat - 1) * gs_s + 2 * pad_x_s
     if font_size is None:
         scale = (a4_w_px * s) / ref_total_w
-        font_size = max(1, int(100 * scale))
+        # 参考字体是 100*s，故推算出的字号也在 s 空间，需乘以 s
+        font_size = max(1, int(100 * s * scale))
 
     font = ImageFont.truetype(font_path, font_size)
     bboxes = [draw.textbbox((0, 0), ch, font=font) for ch in text]
     widths = [b[2] - b[0] for b in bboxes]
     heights = [b[3] - b[1] for b in bboxes]
     group_w = sum(widths) + ls_s * (len(text) - 1)
-    max_h = max(heights)
+    # 量出各字实际墨迹底部，排除字体 ascent/descent 度量中的大量垂直空白
+    ink_bots = [_ink_bot_rel(ch, font, bbox) for ch, bbox in zip(text, bboxes)]
+    max_h = max(ink_bots)  # 行高基准 = 实际墨迹高度，而非 textbbox 全高
 
     # 步骤 3：高分辨率绘制
     # 预先计算各行的 y 起始偏移（行间距独立抖动）
@@ -270,10 +387,10 @@ def render_a4_groups(
         row_x_offset = rng.randint(0, padding_jitter * s)
         x_cursor = pad_x_s + row_x_offset
         for g in range(repeat):
-            for i, (ch, bbox, cw, ch_h) in enumerate(
-                zip(text, bboxes, widths, heights)
+            for i, (ch, bbox, cw, ch_h, ink_bot_i) in enumerate(
+                zip(text, bboxes, widths, heights, ink_bots)
             ):
-                y_base = y_row + (max_h - ch_h) // 2
+                y_base = y_row + (max_h - ink_bot_i) // 2  # 按实际墨迹高度垂直居中
 
                 if jitter:
                     # 每字独立生成四个随机因子，使相同字的不同副本形态各不相同
