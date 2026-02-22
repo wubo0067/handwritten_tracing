@@ -174,9 +174,11 @@ def _render_char_with_stroke_jitter(
     alpha: float,
     sigma: float,
     rng: random.Random,
+    rotation: float = 0.0,
+    scale: float = 1.0,
 ) -> Image.Image:
     """
-    将单字符渲染为 RGBA 小画布并施加笔画弹性形变。
+    将单字符渲染为 RGBA 小画布并施加笔画弹性形变、旋转和缩放。
 
     :param char:       字符
     :param font:       PIL ImageFont 对象
@@ -184,6 +186,8 @@ def _render_char_with_stroke_jitter(
     :param alpha:      笔画扭曲幅度（像素），每字独立传入以形成差异
     :param sigma:      平滑半径，每字独立传入以形成差异
     :param rng:        random.Random 实例
+    :param rotation:   旋转角度（度），正值顺时针，每字独立随机
+    :param scale:      缩放比例（1.0 = 原大），每字独立随机
     :return:           RGBA Image
     """
     dummy = Image.new("RGBA", (1, 1))
@@ -199,7 +203,19 @@ def _render_char_with_stroke_jitter(
         (margin - bbox[0], margin - bbox[1]), char, font=font, fill=(*text_color, 255)
     )
 
-    return _elastic_distort(img, alpha, sigma, rng)
+    glyph = _elastic_distort(img, alpha, sigma, rng)
+
+    # 旋转抖动：每字轻微随机倾斜，模拟手写角度变化
+    if abs(rotation) > 0.01:
+        glyph = glyph.rotate(-rotation, expand=True, resample=Image.BICUBIC)
+
+    # 缩放抖动：每字轻微随机大小变化，模拟笔压/下笔力度差异
+    if abs(scale - 1.0) > 0.001:
+        new_w = max(1, int(glyph.width * scale))
+        new_h = max(1, int(glyph.height * scale))
+        glyph = glyph.resize((new_w, new_h), Image.LANCZOS)
+
+    return glyph
 
 
 def render_text_image(
@@ -283,11 +299,13 @@ def render_a4_groups(
     supersample: int = 4,
     jitter: bool = True,
     stroke_alpha: float = 2.5,
-    stroke_sigma: float = 3.0,
+    stroke_sigma: float = 1.5,
     alpha_jitter: float = 0.4,
-    sigma_jitter: float = 1.0,
+    sigma_jitter: float = 0.5,
     ink_jitter: int = 25,
     baseline_jitter: int = 4,
+    rotation_jitter: float = 3.0,
+    scale_jitter: float = 0.04,
     seed: int | None = None,
 ):
     """
@@ -327,6 +345,10 @@ def render_a4_groups(
     :param ink_jitter:      毎字墓色深浅随机变动范围（RGB 分量偏移像素值），
                             模拟笔压轻重导致的淡淡深深，默认 25
     :param baseline_jitter: 每字基线随机垂直偏移范围（像素），模拟字符上下浮动，默认 4
+    :param rotation_jitter: 每字随机旋转角度范围（度），实际旋转在
+                            [-rotation_jitter, +rotation_jitter] 内均匀随机，默认 3.0
+    :param scale_jitter:    每字随机缩放范围（比例），实际大小在
+                            [1-scale_jitter, 1+scale_jitter] 内随机，默认 0.04（±4%）
     :param seed:            随机种子，传入整数可固定扰动结果以便复现，默认 None
     """
     if not os.path.exists(font_path):
@@ -409,14 +431,24 @@ def render_a4_groups(
                         max(0, min(255, c + ink_delta)) for c in text_color
                     )
                     y_offset = rng.randint(-baseline_jitter * s, baseline_jitter * s)
+                    char_rotation = rng.uniform(-rotation_jitter, rotation_jitter)
+                    char_scale = rng.uniform(1 - scale_jitter, 1 + scale_jitter)
 
                     glyph = _render_char_with_stroke_jitter(
-                        ch, font, char_color, char_alpha, char_sigma, rng
+                        ch,
+                        font,
+                        char_color,
+                        char_alpha,
+                        char_sigma,
+                        rng,
+                        rotation=char_rotation,
+                        scale=char_scale,
                     )
                     # 小图中心对齐到字符理论位置，并加入基线偏移
-                    margin = (glyph.width - cw) // 2
-                    px = x_cursor - bbox[0] - margin
-                    py = y_base - bbox[1] - margin + y_offset
+                    margin_w = (glyph.width - cw) // 2
+                    margin_h = (glyph.height - ch_h) // 2
+                    px = x_cursor - bbox[0] - margin_w
+                    py = y_base - bbox[1] - margin_h + y_offset
                     hi_res.paste(glyph, (px, py), mask=glyph)
                 else:
                     draw = ImageDraw.Draw(hi_res)
@@ -442,13 +474,16 @@ def render_a4_groups(
             )
             x_cursor += jittered_gs
 
-    # 步骤 4：缩小到 A4 尺寸
+    # 步骤 4：缩放到 A4 尺寸（超出时缩小，不足时放大，均保持等比）
     final_w = canvas_w // s
     final_h = canvas_h // s
-    if final_h > a4_h_px:
-        ratio = a4_h_px / final_h
+    # 选取能让内容完整铺满 A4 的最大等比缩放比
+    ratio_w = a4_w_px / final_w
+    ratio_h = a4_h_px / final_h
+    ratio = min(ratio_w, ratio_h)  # 取最小值，保证两边都不超出
+    if abs(ratio - 1.0) > 0.005:
         final_w = int(final_w * ratio)
-        final_h = a4_h_px
+        final_h = int(final_h * ratio)
 
     img = hi_res.resize((final_w, final_h), Image.LANCZOS)
     img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=2))
