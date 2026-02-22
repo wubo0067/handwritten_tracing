@@ -69,39 +69,109 @@ def create_svg(contours, width, height, filename):
         f.write("</svg>")
 
 
+def group_contours_by_projection(thresh_img, contours, expected_count):
+    """
+    使用垂直投影法（列像素求和）确定字符边界，再把轮廓归属到各字符区域。
+
+    原理：手写汉字行中，字符之间存在列像素密度最低的"谷值"，
+    找到 expected_count-1 个最优谷值位置作为分割线即可正确分组。
+    比膨胀连通域法更稳健，不受字内笔画间距影响。
+    """
+    if not contours:
+        return []
+
+    h_img, w_img = thresh_img.shape
+
+    # 先做轻度垂直膨胀，填补笔画内部竖向小空隙，不影响字间水平投影
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+    dilated = cv2.dilate(thresh_img, vert_kernel, iterations=2)
+
+    # 垂直投影：每列的白色像素数
+    proj = np.sum(dilated, axis=0).astype(np.float32) / 255.0  # shape: (w_img,)
+
+    # 移动平均平滑，消除单列噪声
+    smooth_k = max(3, w_img // 80)
+    if smooth_k % 2 == 0:
+        smooth_k += 1
+    proj_smooth = np.convolve(proj, np.ones(smooth_k) / smooth_k, mode="same")
+
+    # 确定有效字符区域（去掉图像两侧的空白边缘）
+    all_x_min = min(cv2.boundingRect(c)[0] for c in contours)
+    all_x_max = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
+
+    # 在每个"字符间区间"内找列投影最小值作为分割点
+    segment_width = (all_x_max - all_x_min) / expected_count
+    cut_positions = []
+    for i in range(expected_count - 1):
+        # 搜索区间：当前字间隙附近 ±30% 段宽
+        seg_center = all_x_min + (i + 1) * segment_width
+        seg_start = int(seg_center - segment_width * 0.35)
+        seg_end = int(seg_center + segment_width * 0.35)
+        seg_start = max(0, min(seg_start, w_img - 1))
+        seg_end = max(0, min(seg_end, w_img))
+        if seg_start >= seg_end:
+            cut_positions.append(int(seg_center))
+            continue
+        local_min_idx = int(np.argmin(proj_smooth[seg_start:seg_end])) + seg_start
+        cut_positions.append(local_min_idx)
+
+    cut_positions.sort()
+    print(f"[投影分割] 分割线 X 坐标：{cut_positions}")
+
+    # 将每个轮廓按重心 X 坐标归属到对应字符组
+    groups: list[list] = [[] for _ in range(expected_count)]
+    for cnt in contours:
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            cx = cv2.boundingRect(cnt)[0] + cv2.boundingRect(cnt)[2] // 2
+        else:
+            cx = int(M["m10"] / M["m00"])
+        seg_idx = 0
+        for cut in cut_positions:
+            if cx > cut:
+                seg_idx += 1
+            else:
+                break
+        seg_idx = min(seg_idx, expected_count - 1)
+        groups[seg_idx].append(cnt)
+
+    result = [g for g in groups if g]
+    if len(result) != expected_count:
+        print(
+            f"[警告] 投影分组结果为 {len(result)} 个字符，与预期 {expected_count} 不符。"
+        )
+    return result
+
+
 def group_contours_by_character(contours, img_width, expected_count):
     """
-    将分散的笔画轮廓按字符分组。
-    使用"最大间距切割法"：找到相邻轮廓间最大的 N-1 个水平空隙作为分界线，
-    比等宽区间划分更能适应字符间距不均匀的情况。
+    将分散的笔画轮廓按字符分组（保留用于无图像上下文的回退场景）。
+    使用"最大间距切割法"：找到相邻轮廓间最大的 N-1 个水平空隙作为分界线。
     """
     if not contours:
         return []
 
     # 计算每个轮廓的 bbox 及左右边界
     bbox_list = [(cv2.boundingRect(c), c) for c in contours]
-    # 按 bbox 左边界 X 排序
     bbox_list.sort(key=lambda b: b[0][0])
 
     sorted_cnts = [item[1] for item in bbox_list]
     sorted_boxes = [item[0] for item in bbox_list]  # (x, y, w, h)
 
-    # 计算相邻轮廓之间的水平间隙：下一个轮廓的左边界 - 当前轮廓的右边界
+    # 计算相邻轮廓之间的水平间隙
     gaps = []
     for i in range(len(sorted_boxes) - 1):
         cur_right = sorted_boxes[i][0] + sorted_boxes[i][2]
         next_left = sorted_boxes[i + 1][0]
         gap = next_left - cur_right
-        gaps.append((gap, i))  # (间距大小, 当前轮廓索引)
+        gaps.append((gap, i))
 
-    # 取最大的 (expected_count - 1) 个间隙作为切割点，并按位置排序
     n_cuts = expected_count - 1
     if len(gaps) >= n_cuts:
         cut_indices = sorted(
             [idx for _, idx in sorted(gaps, key=lambda g: -g[0])[:n_cuts]]
         )
     else:
-        # 间隙数量不足时退回等宽划分
         cut_indices = []
         x_min = sorted_boxes[0][0]
         x_max = sorted_boxes[-1][0] + sorted_boxes[-1][2]
@@ -113,7 +183,6 @@ def group_contours_by_character(contours, img_width, expected_count):
             groups[group_idx].append(cnt)
         return [g for g in groups if g]
 
-    # 按切割点分组
     groups = []
     start = 0
     for cut in cut_indices:
@@ -121,9 +190,7 @@ def group_contours_by_character(contours, img_width, expected_count):
         start = cut + 1
     groups.append(sorted_cnts[start:])
 
-    # 过滤空组
-    groups = [g for g in groups if g]
-    return groups
+    return [g for g in groups if g]
 
 
 def get_group_bounding_box(contours):
@@ -213,8 +280,10 @@ def main(image_path, output_dir="output_glyphs", char_labels=None, expected_coun
 
     # 4. 将轮廓按字符分组（合并同一字的笔画）
     if n_chars < len(valid_contours):
-        print(f"将 {len(valid_contours)} 个轮廓合并为 {n_chars} 个字符组...")
-        char_groups = group_contours_by_character(valid_contours, img.shape[1], n_chars)
+        print(
+            f"将 {len(valid_contours)} 个轮廓合并为 {n_chars} 个字符组（垂直投影法）..."
+        )
+        char_groups = group_contours_by_projection(thresh, valid_contours, n_chars)
     else:
         # 每个轮廓就是一个字符
         char_groups = [[c] for c in valid_contours]
